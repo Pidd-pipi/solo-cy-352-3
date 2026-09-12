@@ -1,5 +1,6 @@
 import { AppError } from "../../common/errors";
 import { AsyncMutex } from "../../common/mutex";
+import { logger } from "../../common/logger";
 import type { BookingStore } from "./booking.store";
 import {
   BUSINESS_CLOSE_HOUR,
@@ -10,7 +11,7 @@ import {
   levelInfo,
   round2,
 } from "./booking.types";
-import type { Booking, MemberLevel } from "./booking.types";
+import type { Booking, Member, MemberLevel } from "./booking.types";
 
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -185,14 +186,20 @@ export class BookingService {
       const amount = requireAmount(value, "充值金额");
       const balance = round2(member.balance + amount);
       const updated = await this.store.updateMember(id, { balance });
-      await this.store.createTransaction({
-        memberId: member.id,
-        memberName: member.name,
-        type: "recharge",
-        amount,
-        balanceAfter: balance,
-        note: `充值 ¥${amount.toFixed(2)}`,
-      });
+      try {
+        await this.store.createTransaction({
+          memberId: member.id,
+          memberName: member.name,
+          type: "recharge",
+          amount,
+          balanceAfter: balance,
+          note: `充值 ¥${amount.toFixed(2)}`,
+        });
+      } catch (error) {
+        // 流水写入失败时把余额改回去，保证充值要么完整生效要么完全不生效
+        await this.restoreMember(member, `recharge txn failed: ${(error as Error).message}`);
+        throw new AppError(500, "充值失败：记录流水时出现错误，已自动回滚，余额未变化");
+      }
       return updated;
     });
   }
@@ -279,31 +286,48 @@ export class BookingService {
       const balance = round2(member.balance - amount);
       await this.store.updateMember(member.id, { balance, points: member.points + pointsEarned });
 
-      const booking = await this.store.createBooking({
-        roomId: room.id,
-        roomName: room.name,
-        memberId: member.id,
-        memberName: member.name,
-        date,
-        startHour,
-        hours,
-        endHour,
-        originalAmount,
-        discount,
-        amount,
-        pointsEarned,
-        status: "active",
-        cancelledAt: null,
-      });
+      // 扣款之后的任一步骤失败都必须整体回滚：删除可能已写入的预约、
+      // 按操作前快照恢复会员余额和积分，保证不会留下消费流水或有效预约。
+      // 存储层保证单步操作原子（见 FileStore.mutate），因此失败时的状态是确定的。
+      let booking: Booking;
+      try {
+        booking = await this.store.createBooking({
+          roomId: room.id,
+          roomName: room.name,
+          memberId: member.id,
+          memberName: member.name,
+          date,
+          startHour,
+          hours,
+          endHour,
+          originalAmount,
+          discount,
+          amount,
+          pointsEarned,
+          status: "active",
+          cancelledAt: null,
+        });
+      } catch (error) {
+        await this.restoreMember(member, `createBooking failed: ${(error as Error).message}`);
+        throw new AppError(500, "预约失败：写入预约记录时出现错误，系统已自动回滚，未产生扣款");
+      }
 
-      await this.store.createTransaction({
-        memberId: member.id,
-        memberName: member.name,
-        type: "payment",
-        amount,
-        balanceAfter: balance,
-        note: `预约「${room.name}」${date} ${startHour}:00-${endHour}:00`,
-      });
+      try {
+        await this.store.createTransaction({
+          memberId: member.id,
+          memberName: member.name,
+          type: "payment",
+          amount,
+          balanceAfter: balance,
+          note: `预约「${room.name}」${date} ${startHour}:00-${endHour}:00`,
+        });
+      } catch (error) {
+        await this.store.deleteBooking(booking.id).catch((rollbackError) => {
+          logger.error(`rollback failed: delete booking ${booking.id}: ${(rollbackError as Error).message}`);
+        });
+        await this.restoreMember(member, `payment txn failed: ${(error as Error).message}`);
+        throw new AppError(500, "预约失败：记录消费流水时出现错误，系统已自动回滚，未产生扣款");
+      }
 
       return booking;
     });
@@ -317,27 +341,51 @@ export class BookingService {
         throw new AppError(400, "该预约已取消，请勿重复操作");
       }
 
-      const member = await this.store.getMember(booking.memberId);
-      if (member) {
-        const balance = round2(member.balance + booking.amount);
-        const points = Math.max(0, member.points - booking.pointsEarned);
-        await this.store.updateMember(member.id, { balance, points });
-        await this.store.createTransaction({
-          memberId: member.id,
-          memberName: member.name,
-          type: "refund",
-          amount: booking.amount,
-          balanceAfter: balance,
-          note: `取消预约「${booking.roomName}」${booking.date} ${booking.startHour}:00-${booking.endHour}:00，退款 ¥${booking.amount.toFixed(2)}`,
-        });
-      }
-
+      // 先标记取消再退款：若退款中途失败，恢复为进行中并收回已退款项，
+      // 保证同一预约的退款要么完整发生一次，要么完全不发生。
       const cancelled = await this.store.updateBooking(id, {
         status: "cancelled",
         cancelledAt: new Date().toISOString(),
       });
+
+      const member = await this.store.getMember(booking.memberId);
+      if (member) {
+        let refunded = false;
+        try {
+          const balance = round2(member.balance + booking.amount);
+          const points = Math.max(0, member.points - booking.pointsEarned);
+          await this.store.updateMember(member.id, { balance, points });
+          refunded = true;
+          await this.store.createTransaction({
+            memberId: member.id,
+            memberName: member.name,
+            type: "refund",
+            amount: booking.amount,
+            balanceAfter: balance,
+            note: `取消预约「${booking.roomName}」${booking.date} ${booking.startHour}:00-${booking.endHour}:00，退款 ¥${booking.amount.toFixed(2)}`,
+          });
+        } catch (error) {
+          if (refunded) {
+            await this.restoreMember(member, `cancel refund failed: ${(error as Error).message}`);
+          }
+          await this.store.updateBooking(id, { status: "active", cancelledAt: null }).catch((rollbackError) => {
+            logger.error(`rollback failed: restore booking ${id}: ${(rollbackError as Error).message}`);
+          });
+          throw new AppError(500, "取消失败：退款过程中出现错误，已自动回滚，预约仍为进行中");
+        }
+      }
+
       return cancelled;
     });
+  }
+
+  /** 把会员余额和积分恢复到操作前快照；回滚本身失败时记录日志告警 */
+  private async restoreMember(member: Member, cause: string): Promise<void> {
+    await this.store
+      .updateMember(member.id, { balance: member.balance, points: member.points })
+      .catch((error) => {
+        logger.error(`rollback failed (${cause}): restore member ${member.id}: ${(error as Error).message}`);
+      });
   }
 
   private parseDate(value: unknown): string {

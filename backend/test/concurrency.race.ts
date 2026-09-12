@@ -88,6 +88,12 @@ class SlowStore implements BookingStore {
     this.bookings[i] = { ...this.bookings[i], ...patch, id };
     return this.bookings[i];
   }
+  async deleteBooking(id: string) {
+    await tick();
+    const before = this.bookings.length;
+    this.bookings = this.bookings.filter((b) => b.id !== id);
+    return this.bookings.length < before;
+  }
 
   async listTransactions() { await tick(); return [...this.transactions]; }
   async createTransaction(input: Omit<WalletTransaction, "id" | "createdAt">) {

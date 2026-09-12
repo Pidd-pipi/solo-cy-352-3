@@ -24,6 +24,7 @@ export interface BookingStore {
   getBooking(id: string): Promise<Booking | null>;
   createBooking(input: Omit<Booking, "id" | "createdAt">): Promise<Booking>;
   updateBooking(id: string, patch: Partial<Omit<Booking, "id">>): Promise<Booking | null>;
+  deleteBooking(id: string): Promise<boolean>;
 
   listTransactions(): Promise<WalletTransaction[]>;
   createTransaction(input: Omit<WalletTransaction, "id" | "createdAt">): Promise<WalletTransaction>;
@@ -38,7 +39,7 @@ interface FileData {
   transactions: WalletTransaction[];
 }
 
-class FileStore implements BookingStore {
+export class FileStore implements BookingStore {
   readonly kind = "file" as const;
   private data: FileData;
   private readonly file: string;
@@ -70,6 +71,21 @@ class FileStore implements BookingStore {
     fs.renameSync(tmp, this.file);
   }
 
+  /**
+   * 单步变更原子化：持久化失败时回滚内存状态并抛错，
+   * 保证一次操作要么完整落盘，要么完全不发生，调用方可以安全地做补偿。
+   */
+  private mutate(fn: () => void): void {
+    const snapshot = JSON.parse(JSON.stringify(this.data)) as FileData;
+    fn();
+    try {
+      this.persist();
+    } catch (error) {
+      this.data = snapshot;
+      throw error;
+    }
+  }
+
   private stamp<T extends object>(input: T, createdAt?: string | null): T & { id: string; createdAt: string } {
     return { ...input, id: randomUUID(), createdAt: createdAt ?? new Date().toISOString() };
   }
@@ -84,24 +100,27 @@ class FileStore implements BookingStore {
 
   async createRoom(input: Omit<Room, "id" | "createdAt">) {
     const room = this.stamp(input);
-    this.data.rooms.push(room);
-    this.persist();
+    this.mutate(() => {
+      this.data.rooms.push(room);
+    });
     return room;
   }
 
   async updateRoom(id: string, patch: Partial<Omit<Room, "id">>) {
     const index = this.data.rooms.findIndex((room) => room.id === id);
     if (index < 0) return null;
-    this.data.rooms[index] = { ...this.data.rooms[index], ...patch, id };
-    this.persist();
-    return this.data.rooms[index];
+    const updated = { ...this.data.rooms[index], ...patch, id };
+    this.mutate(() => {
+      this.data.rooms[index] = updated;
+    });
+    return updated;
   }
 
   async deleteRoom(id: string) {
-    const before = this.data.rooms.length;
-    this.data.rooms = this.data.rooms.filter((room) => room.id !== id);
-    if (this.data.rooms.length === before) return false;
-    this.persist();
+    if (!this.data.rooms.some((room) => room.id === id)) return false;
+    this.mutate(() => {
+      this.data.rooms = this.data.rooms.filter((room) => room.id !== id);
+    });
     return true;
   }
 
@@ -115,24 +134,27 @@ class FileStore implements BookingStore {
 
   async createMember(input: Omit<Member, "id" | "createdAt">) {
     const member = this.stamp(input);
-    this.data.members.push(member);
-    this.persist();
+    this.mutate(() => {
+      this.data.members.push(member);
+    });
     return member;
   }
 
   async updateMember(id: string, patch: Partial<Omit<Member, "id">>) {
     const index = this.data.members.findIndex((member) => member.id === id);
     if (index < 0) return null;
-    this.data.members[index] = { ...this.data.members[index], ...patch, id };
-    this.persist();
-    return this.data.members[index];
+    const updated = { ...this.data.members[index], ...patch, id };
+    this.mutate(() => {
+      this.data.members[index] = updated;
+    });
+    return updated;
   }
 
   async deleteMember(id: string) {
-    const before = this.data.members.length;
-    this.data.members = this.data.members.filter((member) => member.id !== id);
-    if (this.data.members.length === before) return false;
-    this.persist();
+    if (!this.data.members.some((member) => member.id === id)) return false;
+    this.mutate(() => {
+      this.data.members = this.data.members.filter((member) => member.id !== id);
+    });
     return true;
   }
 
@@ -146,17 +168,28 @@ class FileStore implements BookingStore {
 
   async createBooking(input: Omit<Booking, "id" | "createdAt">) {
     const booking = this.stamp(input);
-    this.data.bookings.push(booking);
-    this.persist();
+    this.mutate(() => {
+      this.data.bookings.push(booking);
+    });
     return booking;
   }
 
   async updateBooking(id: string, patch: Partial<Omit<Booking, "id">>) {
     const index = this.data.bookings.findIndex((booking) => booking.id === id);
     if (index < 0) return null;
-    this.data.bookings[index] = { ...this.data.bookings[index], ...patch, id };
-    this.persist();
-    return this.data.bookings[index];
+    const updated = { ...this.data.bookings[index], ...patch, id };
+    this.mutate(() => {
+      this.data.bookings[index] = updated;
+    });
+    return updated;
+  }
+
+  async deleteBooking(id: string) {
+    if (!this.data.bookings.some((booking) => booking.id === id)) return false;
+    this.mutate(() => {
+      this.data.bookings = this.data.bookings.filter((booking) => booking.id !== id);
+    });
+    return true;
   }
 
   async listTransactions() {
@@ -165,8 +198,9 @@ class FileStore implements BookingStore {
 
   async createTransaction(input: Omit<WalletTransaction, "id" | "createdAt">) {
     const txn = this.stamp(input);
-    this.data.transactions.push(txn);
-    this.persist();
+    this.mutate(() => {
+      this.data.transactions.push(txn);
+    });
     return txn;
   }
 }
@@ -311,6 +345,11 @@ class MongoStore implements BookingStore {
   async updateBooking(id: string, patch: Partial<Omit<Booking, "id">>): Promise<Booking | null> {
     const doc = await this.bookings.findByIdAndUpdate(id, patch, { new: true }).lean();
     return doc ? withId(doc as unknown as { _id: unknown } & Booking) : null;
+  }
+
+  async deleteBooking(id: string): Promise<boolean> {
+    const result = await this.bookings.findByIdAndDelete(id);
+    return result !== null;
   }
 
   async listTransactions(): Promise<WalletTransaction[]> {
