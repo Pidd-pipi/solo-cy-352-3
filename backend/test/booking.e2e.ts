@@ -105,6 +105,9 @@ const fixture = {
   booking2hId: "", // 黄金会员 14:00-16:00 的预约（后面用于取消/重复取消）
   leapDayId: "",
   adjacentId: "",
+  room2Id: "", // 并发测试专用包厢
+  concId: "", // 并发测试专用会员
+  concBookingId: "", // 并发下单中唯一胜出的预约
 };
 
 const PRICE = 100; // 测试包厢每小时价格
@@ -251,6 +254,76 @@ test("重复取消被拒绝", "已取消的预约不能重复取消", async () =
   );
 });
 
+test("并发下单同一时段只成功一笔", "同一包厢同一时段并发下单只能成功一笔、只扣一次款", async () => {
+  const CONCURRENT = 6;
+  const before = (await api("GET", "/members")).data.find((m: any) => m.id === fixture.concId);
+  const txnsBefore = (await api("GET", `/transactions?memberId=${fixture.concId}`)).data;
+
+  // 6 个请求同时下单同一包厢同一时段（50/小时 × 3h = 150）
+  const results = await Promise.all(
+    Array.from({ length: CONCURRENT }, () =>
+      api("POST", "/bookings", {
+        roomId: fixture.room2Id,
+        memberId: fixture.concId,
+        date: "2027-04-01",
+        startHour: 19,
+        hours: 3,
+      }),
+    ),
+  );
+
+  const succeeded = results.filter((res) => res.status === 201);
+  const rejected = results.filter((res) => res.status === 409);
+  assert(
+    succeeded.length === 1,
+    `并发下单应只有 1 笔成功，实际成功 ${succeeded.length} 笔（状态分布：${results.map((r) => r.status).join(",")}）`,
+  );
+  assert(
+    rejected.length === CONCURRENT - 1,
+    `其余 ${CONCURRENT - 1} 笔应返回 409 重叠，实际状态分布：${results.map((r) => r.status).join(",")}`,
+  );
+  fixture.concBookingId = succeeded[0].data.id;
+
+  const active = (await api("GET", `/bookings?roomId=${fixture.room2Id}&date=2027-04-01&status=active`)).data;
+  assert(active.length === 1, `该时段有效预约应为 1 笔，实际 ${active.length} 笔`);
+
+  const after = (await api("GET", "/members")).data.find((m: any) => m.id === fixture.concId);
+  assertClose(after.balance, before.balance - 150, "并发后余额（只应扣一笔 150）");
+  assert(after.points === before.points + 150, `积分应只增加 150，实际 ${before.points} -> ${after.points}`);
+
+  const txnsAfter = (await api("GET", `/transactions?memberId=${fixture.concId}`)).data;
+  const newPayments = txnsAfter.filter((t: any) => t.type === "payment").length - txnsBefore.filter((t: any) => t.type === "payment").length;
+  assert(newPayments === 1, `支付流水应只新增 1 条，实际新增 ${newPayments} 条`);
+});
+
+test("并发取消同一预约只退款一次", "同一预约并发取消只能退款一次，余额积分不重复返还", async () => {
+  const CONCURRENT = 6;
+  const before = (await api("GET", "/members")).data.find((m: any) => m.id === fixture.concId);
+
+  const results = await Promise.all(
+    Array.from({ length: CONCURRENT }, () => api("POST", `/bookings/${fixture.concBookingId}/cancel`)),
+  );
+
+  const succeeded = results.filter((res) => res.status === 200);
+  const rejected = results.filter((res) => res.status === 400);
+  assert(
+    succeeded.length === 1,
+    `并发取消应只有 1 次成功，实际成功 ${succeeded.length} 次（状态分布：${results.map((r) => r.status).join(",")}）`,
+  );
+  assert(
+    rejected.length === CONCURRENT - 1,
+    `其余 ${CONCURRENT - 1} 次应返回 400 已取消，实际状态分布：${results.map((r) => r.status).join(",")}`,
+  );
+
+  const after = (await api("GET", "/members")).data.find((m: any) => m.id === fixture.concId);
+  assertClose(after.balance, before.balance + 150, "并发取消后余额（只应退款一次 150）");
+  assert(after.points === before.points - 150, `积分应只扣回一次 150，实际 ${before.points} -> ${after.points}`);
+
+  const txns = (await api("GET", `/transactions?memberId=${fixture.concId}`)).data;
+  const refunds = txns.filter((t: any) => t.type === "refund");
+  assert(refunds.length === 1, `退款流水应只有 1 条，实际 ${refunds.length} 条`);
+});
+
 test("服务重启后数据完整保留", "重启服务后预约、余额、积分、流水都不能丢失", async () => {
   const bookingsBefore = (await api("GET", "/bookings")).data;
   const txnsBefore = (await api("GET", "/transactions")).data;
@@ -299,6 +372,15 @@ async function main(): Promise<number> {
   assert(broke.status === 201, `创建普通会员失败：${JSON.stringify(broke.data)}`);
   fixture.brokeId = broke.data.id;
   await api("POST", `/members/${fixture.brokeId}/recharge`, { amount: 50 });
+
+  // 并发测试专用：50/小时的包厢 + 余额充足的普通会员
+  const room2 = await api("POST", "/rooms", { name: "并发测试包厢", capacity: 8, facilities: [], pricePerHour: 50 });
+  assert(room2.status === 201, `创建并发测试包厢失败：${JSON.stringify(room2.data)}`);
+  fixture.room2Id = room2.data.id;
+  const conc = await api("POST", "/members", { name: "自动化-并发", phone: "13700000003", level: "normal" });
+  assert(conc.status === 201, `创建并发测试会员失败：${JSON.stringify(conc.data)}`);
+  fixture.concId = conc.data.id;
+  await api("POST", `/members/${fixture.concId}/recharge`, { amount: 10000 });
 
   let failures = 0;
   for (const item of cases) {
