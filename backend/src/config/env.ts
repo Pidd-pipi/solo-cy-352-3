@@ -1,3 +1,5 @@
+import path from "path";
+
 export const env = {
   port: Number(process.env.PORT ?? 29512),
   dbHost: process.env.DB_HOST ?? "localhost",
@@ -5,5 +7,7 @@ export const env = {
   dbName: process.env.DB_NAME ?? "app",
   dbUser: process.env.DB_USER ?? "app",
   dbPassword: process.env.DB_PASSWORD ?? "app_pwd",
+  databaseUrl: process.env.DATABASE_URL ?? "",
+  dataFile: process.env.DATA_FILE ?? path.join(process.cwd(), "data", "booking-store.json"),
   jwtSecret: process.env.JWT_SECRET ?? "change_me",
 };

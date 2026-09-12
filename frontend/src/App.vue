@@ -8,9 +8,11 @@ import type { OverviewResponse } from "./types";
 import FeatureStrip from "./components/FeatureStrip.vue";
 import MetricGrid from "./components/MetricGrid.vue";
 import OperationsTable from "./components/OperationsTable.vue";
+import BookingView from "./views/BookingView.vue";
 
 const overview = ref<OverviewResponse>(createFallbackOverview());
 const notice = ref(REQUEST_MESSAGES.overviewFallback);
+const currentView = ref<"overview" | "booking">("booking");
 
 function goHealth() {
   window.location.href = REQUEST_MESSAGES.healthPath;
@@ -33,9 +35,15 @@ onMounted(async () => {
         <span class="brand-code">{{ APP_CODE }}</span>
         <h1 class="brand-title">{{ APP_NAME }}</h1>
       </div>
-      <el-button type="primary" @click="goHealth">API Health</el-button>
+      <div class="topbar-actions">
+        <el-radio-group v-model="currentView">
+          <el-radio-button value="overview">运营总览</el-radio-button>
+          <el-radio-button value="booking">包厢预约</el-radio-button>
+        </el-radio-group>
+        <el-button type="primary" @click="goHealth">API Health</el-button>
+      </div>
     </header>
-    <section class="workspace">
+    <section v-if="currentView === 'overview'" class="workspace">
       <div class="lead-grid">
         <article class="hero-panel">
           <span class="pill">{{ notice }}</span>
@@ -50,5 +58,16 @@ onMounted(async () => {
         <OperationsTable :records="overview.records" />
       </section>
     </section>
+    <section v-else class="workspace">
+      <BookingView />
+    </section>
   </main>
 </template>
+
+<style scoped>
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+</style>
