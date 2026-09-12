@@ -16,8 +16,9 @@ function wrap(handler: Handler): Handler {
       const status = typeof (error as { statusCode?: number }).statusCode === "number"
         ? (error as { statusCode: number }).statusCode
         : 500;
+      const code = (error as { code?: string }).code;
       const message = error instanceof Error ? error.message : "服务器内部错误";
-      response.status(status).json({ message });
+      response.status(status).json(code ? { message, code } : { message });
     }
   };
 }
@@ -69,6 +70,13 @@ export function bookingController(service: BookingService) {
 
     listTransactions: wrap(async (request, response) => {
       response.json(await service.listTransactions(request.query.memberId));
+    }),
+
+    listRecoveries: wrap(async (request, response) => {
+      response.json(await service.listRecoveries(request.query.status));
+    }),
+    resolveRecovery: wrap(async (request, response) => {
+      response.json(await service.resolveRecovery(paramId(request)));
     }),
   };
 }

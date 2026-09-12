@@ -81,6 +81,21 @@ export interface WalletTransaction {
   createdAt: string;
 }
 
+/**
+ * 回滚失败留下的恢复记录：补偿（恢复余额/删除预约等）任一步失败时写入，
+ * 包含人工恢复所需的全部快照数据，处理完毕后标记为 resolved。
+ */
+export interface RecoveryRecord {
+  id: string;
+  operation: "createBooking" | "cancelBooking" | "recharge";
+  status: "pending" | "resolved";
+  reason: string;
+  failures: string[];
+  payload: Record<string, unknown>;
+  createdAt: string;
+  resolvedAt: string | null;
+}
+
 export function levelInfo(level: MemberLevel): MemberLevelInfo {
   return MEMBER_LEVELS.find((item) => item.code === level) ?? MEMBER_LEVELS[0];
 }

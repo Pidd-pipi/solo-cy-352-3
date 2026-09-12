@@ -7,7 +7,7 @@
  */
 import { BookingService } from "../src/modules/booking/booking.service";
 import type { BookingStore } from "../src/modules/booking/booking.store";
-import type { Booking, Member, Room, WalletTransaction } from "../src/modules/booking/booking.types";
+import type { Booking, Member, RecoveryRecord, Room, WalletTransaction } from "../src/modules/booking/booking.types";
 
 function assert(condition: unknown, detail: string): asserts condition {
   if (!condition) throw new Error(detail);
@@ -22,6 +22,7 @@ class SlowStore implements BookingStore {
   private members: Member[] = [];
   private bookings: Booking[] = [];
   private transactions: WalletTransaction[] = [];
+  private recoveries: RecoveryRecord[] = [];
   private seq = 0;
 
   private stamp<T extends object>(input: T): T & { id: string; createdAt: string } {
@@ -101,6 +102,22 @@ class SlowStore implements BookingStore {
     const txn = this.stamp(input);
     this.transactions.push(txn);
     return txn;
+  }
+
+  async listRecoveryRecords() { await tick(); return [...this.recoveries]; }
+  async getRecoveryRecord(id: string) { await tick(); return this.recoveries.find((r) => r.id === id) ?? null; }
+  async createRecoveryRecord(input: Omit<RecoveryRecord, "id" | "createdAt">) {
+    await tick();
+    const record = this.stamp(input);
+    this.recoveries.push(record);
+    return record;
+  }
+  async updateRecoveryRecord(id: string, patch: Partial<Omit<RecoveryRecord, "id">>) {
+    await tick();
+    const i = this.recoveries.findIndex((r) => r.id === id);
+    if (i < 0) return null;
+    this.recoveries[i] = { ...this.recoveries[i], ...patch, id };
+    return this.recoveries[i];
   }
 }
 

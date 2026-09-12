@@ -25,5 +25,8 @@ export function createBookingRouter(service: BookingService): Router {
 
   router.get("/booking/transactions", controller.listTransactions);
 
+  router.get("/booking/recoveries", controller.listRecoveries);
+  router.post("/booking/recoveries/:id/resolve", controller.resolveRecovery);
+
   return router;
 }

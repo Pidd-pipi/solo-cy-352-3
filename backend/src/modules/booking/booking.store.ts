@@ -4,7 +4,7 @@ import path from "path";
 import mongoose from "mongoose";
 import { env } from "../../config/env";
 import { logger } from "../../common/logger";
-import type { Booking, Member, Room, WalletTransaction } from "./booking.types";
+import type { Booking, Member, RecoveryRecord, Room, WalletTransaction } from "./booking.types";
 
 export interface BookingStore {
   readonly kind: "mongo" | "file";
@@ -28,6 +28,11 @@ export interface BookingStore {
 
   listTransactions(): Promise<WalletTransaction[]>;
   createTransaction(input: Omit<WalletTransaction, "id" | "createdAt">): Promise<WalletTransaction>;
+
+  listRecoveryRecords(): Promise<RecoveryRecord[]>;
+  getRecoveryRecord(id: string): Promise<RecoveryRecord | null>;
+  createRecoveryRecord(input: Omit<RecoveryRecord, "id" | "createdAt">): Promise<RecoveryRecord>;
+  updateRecoveryRecord(id: string, patch: Partial<Omit<RecoveryRecord, "id">>): Promise<RecoveryRecord | null>;
 }
 
 /* ------------------------------ JSON 文件存储 ------------------------------ */
@@ -37,6 +42,7 @@ interface FileData {
   members: Member[];
   bookings: Booking[];
   transactions: WalletTransaction[];
+  recoveries: RecoveryRecord[];
 }
 
 export class FileStore implements BookingStore {
@@ -58,9 +64,10 @@ export class FileStore implements BookingStore {
         members: parsed.members ?? [],
         bookings: parsed.bookings ?? [],
         transactions: parsed.transactions ?? [],
+        recoveries: parsed.recoveries ?? [],
       };
     } catch {
-      return { rooms: [], members: [], bookings: [], transactions: [] };
+      return { rooms: [], members: [], bookings: [], transactions: [], recoveries: [] };
     }
   }
 
@@ -203,6 +210,32 @@ export class FileStore implements BookingStore {
     });
     return txn;
   }
+
+  async listRecoveryRecords() {
+    return [...this.data.recoveries];
+  }
+
+  async getRecoveryRecord(id: string) {
+    return this.data.recoveries.find((record) => record.id === id) ?? null;
+  }
+
+  async createRecoveryRecord(input: Omit<RecoveryRecord, "id" | "createdAt">) {
+    const record = this.stamp(input);
+    this.mutate(() => {
+      this.data.recoveries.push(record);
+    });
+    return record;
+  }
+
+  async updateRecoveryRecord(id: string, patch: Partial<Omit<RecoveryRecord, "id">>) {
+    const index = this.data.recoveries.findIndex((record) => record.id === id);
+    if (index < 0) return null;
+    const updated = { ...this.data.recoveries[index], ...patch, id };
+    this.mutate(() => {
+      this.data.recoveries[index] = updated;
+    });
+    return updated;
+  }
 }
 
 /* ------------------------------ MongoDB 存储 ------------------------------ */
@@ -264,6 +297,19 @@ const transactionSchema = new mongoose.Schema(
   { versionKey: false },
 );
 
+const recoverySchema = new mongoose.Schema(
+  {
+    operation: { type: String, required: true },
+    status: { type: String, required: true },
+    reason: { type: String, required: true },
+    failures: { type: [String], default: [] },
+    payload: { type: mongoose.Schema.Types.Mixed, default: {} },
+    createdAt: { type: String, required: true },
+    resolvedAt: { type: String, default: null },
+  },
+  { versionKey: false },
+);
+
 function withId<T extends { _id: unknown }>(doc: T): Omit<T, "_id"> & { id: string } {
   const { _id, ...rest } = doc;
   return { ...rest, id: String(_id) } as Omit<T, "_id"> & { id: string };
@@ -276,6 +322,7 @@ class MongoStore implements BookingStore {
   private members = mongoose.model("Member", memberSchema);
   private bookings = mongoose.model("Booking", bookingSchema);
   private transactions = mongoose.model("WalletTransaction", transactionSchema);
+  private recoveries = mongoose.model("RecoveryRecord", recoverySchema);
 
   async listRooms(): Promise<Room[]> {
     const docs = await this.rooms.find().lean();
@@ -360,6 +407,26 @@ class MongoStore implements BookingStore {
   async createTransaction(input: Omit<WalletTransaction, "id" | "createdAt">): Promise<WalletTransaction> {
     const doc = await this.transactions.create({ ...input, createdAt: new Date().toISOString() });
     return withId(doc.toObject() as { _id: unknown } & WalletTransaction);
+  }
+
+  async listRecoveryRecords(): Promise<RecoveryRecord[]> {
+    const docs = await this.recoveries.find().lean();
+    return docs.map((doc) => withId(doc as unknown as { _id: unknown } & RecoveryRecord));
+  }
+
+  async getRecoveryRecord(id: string): Promise<RecoveryRecord | null> {
+    const doc = await this.recoveries.findById(id).lean();
+    return doc ? withId(doc as unknown as { _id: unknown } & RecoveryRecord) : null;
+  }
+
+  async createRecoveryRecord(input: Omit<RecoveryRecord, "id" | "createdAt">): Promise<RecoveryRecord> {
+    const doc = await this.recoveries.create({ ...input, createdAt: new Date().toISOString() });
+    return withId(doc.toObject() as { _id: unknown } & RecoveryRecord);
+  }
+
+  async updateRecoveryRecord(id: string, patch: Partial<Omit<RecoveryRecord, "id">>): Promise<RecoveryRecord | null> {
+    const doc = await this.recoveries.findByIdAndUpdate(id, patch, { new: true }).lean();
+    return doc ? withId(doc as unknown as { _id: unknown } & RecoveryRecord) : null;
   }
 }
 

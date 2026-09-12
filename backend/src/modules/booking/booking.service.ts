@@ -11,7 +11,7 @@ import {
   levelInfo,
   round2,
 } from "./booking.types";
-import type { Booking, Member, MemberLevel } from "./booking.types";
+import type { Booking, Member, MemberLevel, RecoveryRecord } from "./booking.types";
 
 const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -196,8 +196,12 @@ export class BookingService {
           note: `充值 ¥${amount.toFixed(2)}`,
         });
       } catch (error) {
-        // 流水写入失败时把余额改回去，保证充值要么完整生效要么完全不生效
-        await this.restoreMember(member, `recharge txn failed: ${(error as Error).message}`);
+        await this.compensate({
+          operation: "recharge",
+          cause: `记录充值流水失败：${(error as Error).message}`,
+          payload: { memberId: member.id, memberName: member.name, amount, expectedBalance: member.balance },
+          steps: [{ label: "恢复会员余额", run: () => this.restoreMemberSnapshot(member) }],
+        });
         throw new AppError(500, "充值失败：记录流水时出现错误，已自动回滚，余额未变化");
       }
       return updated;
@@ -308,7 +312,24 @@ export class BookingService {
           cancelledAt: null,
         });
       } catch (error) {
-        await this.restoreMember(member, `createBooking failed: ${(error as Error).message}`);
+        await this.compensate({
+          operation: "createBooking",
+          cause: `写入预约记录失败：${(error as Error).message}`,
+          payload: {
+            memberId: member.id,
+            memberName: member.name,
+            expectedBalance: member.balance,
+            expectedPoints: member.points,
+            deductedAmount: amount,
+            pointsEarned,
+            roomId: room.id,
+            roomName: room.name,
+            date,
+            startHour,
+            endHour,
+          },
+          steps: [{ label: "恢复会员余额和积分", run: () => this.restoreMemberSnapshot(member) }],
+        });
         throw new AppError(500, "预约失败：写入预约记录时出现错误，系统已自动回滚，未产生扣款");
       }
 
@@ -322,10 +343,34 @@ export class BookingService {
           note: `预约「${room.name}」${date} ${startHour}:00-${endHour}:00`,
         });
       } catch (error) {
-        await this.store.deleteBooking(booking.id).catch((rollbackError) => {
-          logger.error(`rollback failed: delete booking ${booking.id}: ${(rollbackError as Error).message}`);
+        await this.compensate({
+          operation: "createBooking",
+          cause: `记录消费流水失败：${(error as Error).message}`,
+          payload: {
+            memberId: member.id,
+            memberName: member.name,
+            expectedBalance: member.balance,
+            expectedPoints: member.points,
+            deductedAmount: amount,
+            pointsEarned,
+            bookingId: booking.id,
+            roomId: room.id,
+            roomName: room.name,
+            date,
+            startHour,
+            endHour,
+          },
+          steps: [
+            {
+              label: "删除已创建的预约",
+              run: async () => {
+                const removed = await this.store.deleteBooking(booking.id);
+                if (!removed) throw new Error(`预约 ${booking.id} 不存在，无法删除`);
+              },
+            },
+            { label: "恢复会员余额和积分", run: () => this.restoreMemberSnapshot(member) },
+          ],
         });
-        await this.restoreMember(member, `payment txn failed: ${(error as Error).message}`);
         throw new AppError(500, "预约失败：记录消费流水时出现错误，系统已自动回滚，未产生扣款");
       }
 
@@ -365,11 +410,31 @@ export class BookingService {
             note: `取消预约「${booking.roomName}」${booking.date} ${booking.startHour}:00-${booking.endHour}:00，退款 ¥${booking.amount.toFixed(2)}`,
           });
         } catch (error) {
+          const steps: { label: string; run: () => Promise<unknown> }[] = [];
           if (refunded) {
-            await this.restoreMember(member, `cancel refund failed: ${(error as Error).message}`);
+            steps.push({ label: "收回已退款项并恢复积分", run: () => this.restoreMemberSnapshot(member) });
           }
-          await this.store.updateBooking(id, { status: "active", cancelledAt: null }).catch((rollbackError) => {
-            logger.error(`rollback failed: restore booking ${id}: ${(rollbackError as Error).message}`);
+          steps.push({
+            label: "恢复预约为进行中",
+            run: async () => {
+              const restored = await this.store.updateBooking(id, { status: "active", cancelledAt: null });
+              if (!restored) throw new Error(`预约 ${id} 不存在，无法恢复`);
+            },
+          });
+          await this.compensate({
+            operation: "cancelBooking",
+            cause: `取消退款失败：${(error as Error).message}`,
+            payload: {
+              bookingId: id,
+              memberId: member.id,
+              memberName: member.name,
+              refundAmount: booking.amount,
+              pointsEarned: booking.pointsEarned,
+              expectedMemberBalance: member.balance,
+              expectedMemberPoints: member.points,
+              expectedBookingStatus: "active",
+            },
+            steps,
           });
           throw new AppError(500, "取消失败：退款过程中出现错误，已自动回滚，预约仍为进行中");
         }
@@ -379,13 +444,79 @@ export class BookingService {
     });
   }
 
-  /** 把会员余额和积分恢复到操作前快照；回滚本身失败时记录日志告警 */
-  private async restoreMember(member: Member, cause: string): Promise<void> {
-    await this.store
-      .updateMember(member.id, { balance: member.balance, points: member.points })
-      .catch((error) => {
-        logger.error(`rollback failed (${cause}): restore member ${member.id}: ${(error as Error).message}`);
+  /** 把会员余额和积分恢复到操作前快照；会员不存在时抛错（视为恢复失败） */
+  private async restoreMemberSnapshot(member: Member): Promise<void> {
+    const restored = await this.store.updateMember(member.id, { balance: member.balance, points: member.points });
+    if (!restored) throw new Error(`会员 ${member.id} 不存在，无法恢复`);
+  }
+
+  /**
+   * 执行补偿：逐步尽力恢复（某步失败不中断后续步骤），全部成功则静默返回；
+   * 任一步失败则写入可追踪的恢复记录，并抛出带 ROLLBACK_FAILED 错误码的
+   * 明确错误——此时系统状态不确定，绝不能按普通业务失败处理。
+   */
+  private async compensate(options: {
+    operation: RecoveryRecord["operation"];
+    cause: string;
+    payload: Record<string, unknown>;
+    steps: { label: string; run: () => Promise<unknown> }[];
+  }): Promise<void> {
+    const failures: string[] = [];
+    for (const step of options.steps) {
+      try {
+        await step.run();
+      } catch (error) {
+        const detail = `${step.label}失败（${(error as Error).message}）`;
+        failures.push(detail);
+        logger.error(`compensation step failed [${options.operation}]: ${detail}`);
+      }
+    }
+    if (failures.length === 0) return;
+
+    let recordId: string | null = null;
+    try {
+      const record = await this.store.createRecoveryRecord({
+        operation: options.operation,
+        status: "pending",
+        reason: options.cause,
+        failures,
+        payload: options.payload,
+        resolvedAt: null,
       });
+      recordId = record.id;
+    } catch (error) {
+      // 恢复记录也写不进去：日志兜底保留全部快照，接口仍明确报回滚失败
+      logger.error(`failed to persist recovery record: ${(error as Error).message}; payload=${JSON.stringify(options.payload)}`);
+    }
+    const tracking = recordId ? `恢复记录 ${recordId}` : "恢复记录写入失败（关键数据详见服务日志）";
+    throw new AppError(
+      500,
+      `操作失败且自动回滚未完成：${failures.join("；")}。系统状态可能不一致，${tracking}，请立即联系管理员人工处理`,
+      "ROLLBACK_FAILED",
+    );
+  }
+
+  /* ------------------------------ 恢复记录 ------------------------------ */
+
+  async listRecoveries(status?: unknown) {
+    const records = await this.store.listRecoveryRecords();
+    return records
+      .filter((record) => (status === "pending" || status === "resolved" ? record.status === status : true))
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  async resolveRecovery(id: string) {
+    return this.writeLock.run(async () => {
+      const record = await this.store.getRecoveryRecord(id);
+      if (!record) throw new AppError(404, "恢复记录不存在");
+      if (record.status === "resolved") {
+        throw new AppError(400, "该恢复记录已处理完毕，请勿重复操作");
+      }
+      return this.store.updateRecoveryRecord(id, {
+        status: "resolved",
+        resolvedAt: new Date().toISOString(),
+      });
+    });
   }
 
   private parseDate(value: unknown): string {

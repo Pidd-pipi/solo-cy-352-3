@@ -324,6 +324,13 @@ test("并发取消同一预约只退款一次", "同一预约并发取消只能�
   assert(refunds.length === 1, `退款流水应只有 1 条，实际 ${refunds.length} 条`);
 });
 
+test("恢复记录接口可用", "回滚失败的恢复记录必须可查询、可标记处理", async () => {
+  const list = await api("GET", "/recoveries");
+  assert(list.status === 200 && Array.isArray(list.data), `应返回恢复记录数组，实际 ${list.status}：${JSON.stringify(list.data)}`);
+  const missing = await api("POST", "/recoveries/not-exist/resolve");
+  assert(missing.status === 404, `不存在的记录应返回 404，实际 ${missing.status}`);
+});
+
 test("服务重启后数据完整保留", "重启服务后预约、余额、积分、流水都不能丢失", async () => {
   const bookingsBefore = (await api("GET", "/bookings")).data;
   const txnsBefore = (await api("GET", "/transactions")).data;
