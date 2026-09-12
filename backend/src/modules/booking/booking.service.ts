@@ -206,7 +206,7 @@ export class BookingService {
     const memberId = requireText(input.memberId, "会员");
     const date = this.parseDate(input.date);
     const startHour = this.parseHour(input.startHour, "开始时间");
-    const hours = this.parseHour(input.hours, "预约时长");
+    const hours = this.parseDuration(input.hours);
     const endHour = startHour + hours;
 
     if (startHour < BUSINESS_OPEN_HOUR || startHour >= BUSINESS_CLOSE_HOUR) {
@@ -319,9 +319,12 @@ export class BookingService {
     if (typeof value !== "string" || !DATE_PATTERN.test(value)) {
       throw new AppError(400, "预约日期格式应为 YYYY-MM-DD");
     }
-    const time = new Date(`${value}T00:00:00`);
-    if (Number.isNaN(time.getTime())) {
-      throw new AppError(400, "预约日期不存在");
+    // new Date("2026-02-30") 会自动进位到 3 月 2 日而不是报错，
+    // 因此按年月日分量重建并逐一比对，拒绝 2 月 30 日这类不存在的日期。
+    const [year, month, day] = value.split("-").map(Number);
+    const time = new Date(year, month - 1, day);
+    if (time.getFullYear() !== year || time.getMonth() !== month - 1 || time.getDate() !== day) {
+      throw new AppError(400, `日期 ${value} 不存在，请选择有效日期`);
     }
     return value;
   }
@@ -332,6 +335,18 @@ export class BookingService {
       throw new AppError(400, `${field}不正确`);
     }
     return hour;
+  }
+
+  private parseDuration(value: unknown): number {
+    const hours = Number(value);
+    if (!Number.isInteger(hours) || hours < 1) {
+      throw new AppError(400, "预约时长至少为 1 小时");
+    }
+    const maxHours = BUSINESS_CLOSE_HOUR - BUSINESS_OPEN_HOUR;
+    if (hours > maxHours) {
+      throw new AppError(400, `预约时长不能超过 ${maxHours} 小时`);
+    }
+    return hours;
   }
 
   /* -------------------------------- 流水 -------------------------------- */
